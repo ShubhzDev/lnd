@@ -106,6 +106,25 @@
   protocol state machine and invalidating nonces after each signing round
   completes.
 
+* Added per-peer and global rate limiters for incoming onion messages. The
+  existing per-peer mailbox + RED only bounds in-flight queue depth, leaving
+  unpaid forwarded onion message traffic unbounded in throughput. Two new
+  token-bucket limiters now drop traffic at ingress before it reaches the
+  Sphinx unwrap and replay-DB paths. Tokens are bytes rather than raw
+  message counts, so small onion messages pay proportionally less of the
+  budget than spec-max ones and the configured limit directly reflects
+  bandwidth consumed. Defaults are roughly `0.5 Mbps` (512 Kbps, 256 KiB
+  burst) per peer and `5 Mbps` (5120 Kbps, 1600 KiB burst) globally — sized
+  so onion message traffic cannot dwarf a typical routing node's payment
+  traffic. All four thresholds are tunable via
+  `protocol.onion-msg-peer-kbps`, `protocol.onion-msg-peer-burst-bytes`,
+  `protocol.onion-msg-global-kbps`, and
+  `protocol.onion-msg-global-burst-bytes`; setting both the rate and the
+  burst of a given limiter to `0` disables that limiter entirely, while
+  setting one to `0` with the other positive, or setting a burst smaller
+  than a single maximum-sized wire message, is rejected at startup as a
+  configuration error.
+
 ## RPC Additions
 
 * [Added `DeleteForwardingHistory`
