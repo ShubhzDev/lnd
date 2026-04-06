@@ -25,11 +25,43 @@ const (
 	// messages are dropped. Must be strictly less than
 	// DefaultOnionMailboxSize.
 	DefaultMinREDThreshold = 40
+
+	// DefaultPeerOnionMsgKbps is the default sustained per-peer onion
+	// message ingress rate, in decimal kilobits per second (1 Kbps =
+	// 1000 bits/s). At ~32 KB per spec-max onion packet this is roughly
+	// two max-size messages per second per peer. A value of zero
+	// disables the per-peer limiter entirely.
+	DefaultPeerOnionMsgKbps = 512
+
+	// DefaultPeerOnionMsgBurstBytes is the default per-peer token bucket
+	// depth, in bytes. Sized to hold approximately eight spec-max onion
+	// messages so a peer can briefly burst above the sustained rate
+	// without drops.
+	DefaultPeerOnionMsgBurstBytes = 8 * 32 * 1024
+
+	// DefaultGlobalOnionMsgKbps is the default sustained aggregate onion
+	// message ingress rate across all peers, in decimal kilobits per
+	// second. Targets ~5 Mbps worst-case ingress so that onion message
+	// bandwidth cannot dwarf a typical routing node's payment traffic.
+	// A value of zero disables the global limiter entirely.
+	DefaultGlobalOnionMsgKbps = 5120
+
+	// DefaultGlobalOnionMsgBurstBytes is the default global token bucket
+	// depth, in bytes. Sized to hold approximately fifty spec-max onion
+	// messages.
+	DefaultGlobalOnionMsgBurstBytes = 50 * 32 * 1024
 )
 
 // Compile-time assertion: DefaultMinREDThreshold must be strictly less than
 // DefaultOnionMailboxSize. If this overflows, the constants are misconfigured.
 const _ = uint(DefaultOnionMailboxSize - DefaultMinREDThreshold - 1)
+
+// Compile-time assertions: the default burst sizes must be able to hold at
+// least one maximum-sized wire message, otherwise every AllowN call on a
+// freshly constructed limiter would fail and the limiter would silently
+// drop all onion traffic.
+const _ = uint(DefaultPeerOnionMsgBurstBytes - lnwire.MaxMsgBody)
+const _ = uint(DefaultGlobalOnionMsgBurstBytes - lnwire.MaxMsgBody)
 
 // Request is a message sent to an OnionPeerActor when an onion message is
 // received from the peer. The actor processes the message through the full
