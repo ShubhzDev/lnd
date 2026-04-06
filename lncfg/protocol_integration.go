@@ -77,6 +77,29 @@ type ProtocolOptions struct {
 	// NoOnionMessagesOption disables onion message forwarding.
 	NoOnionMessagesOption bool `long:"no-onion-messages" description:"disable support for onion messaging"`
 
+	// OnionMsgPeerKbps is the maximum sustained onion message ingress
+	// bandwidth, in decimal kilobits per second (1 Kbps = 1000 bits/s),
+	// that will be accepted from any single peer. Setting this to zero,
+	// together with a zero burst, disables the per-peer onion message
+	// rate limiter.
+	OnionMsgPeerKbps uint64 `long:"onion-msg-peer-kbps" description:"max onion message ingress rate from a single peer, in decimal kilobits per second; set both this and onion-msg-peer-burst-bytes to 0 to disable the per-peer limiter"`
+
+	// OnionMsgPeerBurstBytes is the token bucket depth, in bytes, used
+	// by the per-peer onion message rate limiter. A value of zero,
+	// paired with a zero rate, disables the per-peer limiter.
+	OnionMsgPeerBurstBytes uint64 `long:"onion-msg-peer-burst-bytes" description:"token bucket burst for the per-peer onion message limiter, in bytes; set both this and onion-msg-peer-kbps to 0 to disable the per-peer limiter"`
+
+	// OnionMsgGlobalKbps is the maximum sustained onion message ingress
+	// bandwidth, in decimal kilobits per second, that will be accepted
+	// across all peers combined. Setting this to zero, together with a
+	// zero burst, disables the global onion message rate limiter.
+	OnionMsgGlobalKbps uint64 `long:"onion-msg-global-kbps" description:"max onion message ingress rate across all peers combined, in decimal kilobits per second; set both this and onion-msg-global-burst-bytes to 0 to disable the global limiter"`
+
+	// OnionMsgGlobalBurstBytes is the token bucket depth, in bytes, used
+	// by the global onion message rate limiter. A value of zero, paired
+	// with a zero rate, disables the global limiter.
+	OnionMsgGlobalBurstBytes uint64 `long:"onion-msg-global-burst-bytes" description:"token bucket burst for the global onion message limiter, in bytes; set both this and onion-msg-global-kbps to 0 to disable the global limiter"`
+
 	// NoExperimentalAccountabilityOption disables experimental accountability.
 	NoExperimentalAccountabilityOption bool `long:"no-experimental-accountability" description:"do not forward experimental accountability signals"`
 
