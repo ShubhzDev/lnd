@@ -315,6 +315,18 @@ type Config struct {
 	// message actor. If nil, onion messaging is disabled.
 	SpawnOnionActor onionmessage.OnionActorFactory
 
+	// OnionGlobalLimiter caps the aggregate rate of incoming onion
+	// messages across all peers. It is consulted after the per-peer
+	// limiter at ingress so that traffic already rejected by its source
+	// peer's own bucket cannot drain the shared budget, and may be a
+	// noop limiter if globally disabled.
+	OnionGlobalLimiter onionmessage.RateLimiter
+
+	// OnionPeerLimiter caps the per-peer rate of incoming onion messages.
+	// Buckets are created lazily on first use and removed when the peer
+	// disconnects.
+	OnionPeerLimiter *onionmessage.PeerRateLimiter
+
 	// OnionActorOpts returns ActorOptions for the onion peer actor
 	// being spawned for the given peer. This allows per-peer
 	// customization of mailbox size, drop predicates, etc.
@@ -1729,6 +1741,23 @@ func (p *Brontide) Disconnect(reason error) {
 	// Stop the onion peer actor if one was spawned.
 	p.StopOnionActorIfExists()
 
+	// Evict this peer's bucket from the per-peer onion message rate
+	// limiter so the registry's memory footprint stays bounded across
+	// the lifetime of the process. This is racy with in-flight Allow
+	// calls from the still-draining readHandler: if one wins the race
+	// after the Forget, it will re-insert a fresh bucket. The orphan is
+	// bounded to a single entry per peer and is reaped on the next
+	// reconnect-then-disconnect cycle, so we tolerate it rather than
+	// adding additional synchronization on the hot path.
+	//
+	// Note that because Forget drops the bucket, a peer that cycles
+	// disconnect/reconnect rapidly can amplify its effective per-peer
+	// rate: each reconnect yields a fresh full-burst bucket. The global
+	// limiter is the hard ceiling that guards against this.
+	if p.cfg.OnionPeerLimiter != nil {
+		p.cfg.OnionPeerLimiter.Forget(p.PubKey())
+	}
+
 	// Ensure that the TCP connection is properly closed before continuing.
 	p.cfg.Conn.Close()
 
@@ -2331,6 +2360,26 @@ out:
 			discStream.AddMsg(msg)
 
 		case *lnwire.OnionMessage:
+			// Charge the limiter the on-the-wire size of the
+			// message so the byte-granular bucket reflects
+			// actual ingress bandwidth rather than raw message
+			// counts.
+			if reason, ok := allowOnionMessage(
+				p.cfg.OnionGlobalLimiter,
+				p.cfg.OnionPeerLimiter,
+				p.PubKey(), msg.WireSize(),
+			); !ok {
+				logFirstOnionDrop(
+					p.log, reason,
+					p.cfg.OnionGlobalLimiter,
+					p.cfg.OnionPeerLimiter,
+				)
+				p.log.Debugf("dropping onion message: %s",
+					reason)
+
+				break
+			}
+
 			p.onionActorRef.WhenSome(
 				func(ref onionmessage.OnionPeerActorRef) {
 					// TODO(elle): thread contexts through
