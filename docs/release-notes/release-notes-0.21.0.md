@@ -125,6 +125,20 @@
   than a single maximum-sized wire message, is rejected at startup as a
   configuration error.
 
+* Incoming onion messages from peers that have no fully open channel with
+  us are now dropped at ingress before the rate limiters are consulted.
+  Without this gate, onion message forwarding is an unpaid side channel
+  that a Sybil attacker can exploit by spinning up arbitrarily many
+  no-cost identities and burning a full per-peer byte budget on each —
+  the global limiter alone cannot prevent service denial because the
+  shared bucket is quickly saturated. Requiring a funded channel turns
+  new identities into a real capital cost and flips the Sybil economics.
+  Pending channels are intentionally excluded from the gate because they
+  are cheap to open and prone to getting stuck, and so do not provide
+  the guarantee. The check is O(1) on the hot path via an atomic
+  active-channel counter maintained alongside the per-peer channel
+  registry, so it adds no measurable cost to the ingress pipeline.
+
 ## RPC Additions
 
 * [Added `DeleteForwardingHistory`

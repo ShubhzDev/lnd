@@ -612,6 +612,17 @@ type Brontide struct {
 	activeChannels *lnutils.SyncMap[
 		lnwire.ChannelID, *lnwallet.LightningChannel]
 
+	// numActiveChans shadows the count of non-pending entries in
+	// activeChannels as an atomic integer. It exists so that hot-path
+	// callers — notably the onion message ingress gate, which runs on
+	// every incoming onion packet — can ask "does this peer have any
+	// active channel with us" in O(1) instead of iterating the
+	// activeChannels registry. It is maintained in lockstep with
+	// activeChannels via Swap and LoadAndDelete at every mutation
+	// site, so transitions from pending (nil value) to active and
+	// from active to closed are reflected atomically.
+	numActiveChans atomic.Int32
+
 	// addedChannels tracks any new channels opened during this peer's
 	// lifecycle. We use this to filter out these new channels when the time
 	// comes to request a reenable for active channels, since they will have
@@ -1429,7 +1440,11 @@ func (p *Brontide) loadActiveChannels(chans []*channeldb.OpenChannel) (
 				"switch: %v", chanPoint, err)
 		}
 
+		// loadActiveChannels runs during Start() before any other
+		// goroutine can mutate activeChannels, so a plain Store
+		// paired with a counter increment is race-free here.
 		p.activeChannels.Store(chanID, lnChan)
+		p.numActiveChans.Add(1)
 
 		// We're using the old co-op close, so we don't need to init
 		// the new RBF chan closer.
@@ -2363,11 +2378,14 @@ out:
 			// Charge the limiter the on-the-wire size of the
 			// message so the byte-granular bucket reflects
 			// actual ingress bandwidth rather than raw message
-			// counts.
+			// counts. The channel-gate hint is sourced from the
+			// atomic active-channel counter so the check is
+			// O(1) on the hot path.
 			if reason, ok := allowOnionMessage(
 				p.cfg.OnionGlobalLimiter,
 				p.cfg.OnionPeerLimiter,
 				p.PubKey(), msg.WireSize(),
+				p.hasActiveChannels(),
 			); !ok {
 				logFirstOnionDrop(
 					p.log, reason,
@@ -2494,6 +2512,17 @@ func (p *Brontide) isPendingChannel(chanID lnwire.ChannelID) bool {
 func (p *Brontide) hasChannel(chanID lnwire.ChannelID) bool {
 	_, ok := p.activeChannels.Load(chanID)
 	return ok
+}
+
+// hasActiveChannels reports whether this peer has at least one fully open
+// (non-pending) channel with us. Pending channels are excluded because
+// they do not yet provide the Sybil-resistance guarantees the onion
+// message ingress gate relies on. The check reads an atomic counter
+// maintained alongside activeChannels at every mutation site, so it is
+// O(1) and cheap enough to run on every incoming onion message without
+// iterating a map.
+func (p *Brontide) hasActiveChannels() bool {
+	return p.numActiveChans.Load() > 0
 }
 
 // storeError stores an error in our peer's buffer of recent errors with the
@@ -4711,7 +4740,15 @@ func WaitForChanToClose(bestHeight uint32, notifier chainntnfs.ChainNotifier,
 func (p *Brontide) WipeChannel(chanPoint *wire.OutPoint) {
 	chanID := lnwire.NewChanIDFromOutPoint(*chanPoint)
 
-	p.activeChannels.Delete(chanID)
+	// LoadAndDelete atomically removes the entry and returns the prior
+	// value so we can update numActiveChans in lockstep. We only
+	// decrement when the prior value was non-nil (i.e. the entry
+	// represented a fully-open channel); pending channels (nil value)
+	// never contributed to the active count and must not decrement it.
+	prev, loaded := p.activeChannels.LoadAndDelete(chanID)
+	if loaded && prev != nil {
+		p.numActiveChans.Add(-1)
+	}
 
 	// Instruct the HtlcSwitch to close this link as the channel is no
 	// longer active.
@@ -5431,8 +5468,17 @@ func (p *Brontide) addActiveChannel(c *lnpeer.NewChannel) error {
 		return fmt.Errorf("unable to create LightningChannel: %w", err)
 	}
 
-	// Store the channel in the activeChannels map.
-	p.activeChannels.Store(chanID, lnChan)
+	// Store the channel in the activeChannels map and update the
+	// active-channel counter. Swap atomically replaces any prior entry
+	// so we can tell whether this is a brand-new channel (no prior
+	// entry) or a pending-to-active promotion (prior entry was a typed
+	// nil). In both cases the count of non-pending channels increases
+	// by one; in the rare case where a live entry is somehow already
+	// present we leave the counter alone to avoid double-counting.
+	prev, loaded := p.activeChannels.Swap(chanID, lnChan)
+	if !loaded || prev == nil {
+		p.numActiveChans.Add(1)
+	}
 
 	p.log.Infof("New channel active ChannelPoint(%v) with peer", chanPoint)
 
@@ -5582,8 +5628,15 @@ func (p *Brontide) handleRemovePendingChannel(req *newChannelMsg) {
 		p.log.Warnf("Channel(%v) not found, removing it anyway", chanID)
 	}
 
-	// Remove the record of this pending channel.
-	p.activeChannels.Delete(chanID)
+	// Remove the record of this pending channel. We go through
+	// LoadAndDelete so that the active-channel counter is updated in
+	// the rare case where the entry had been promoted to active via a
+	// concurrent path before we got here — the pending check above is
+	// advisory, not locked, so it cannot on its own rule that out.
+	prev, loaded := p.activeChannels.LoadAndDelete(chanID)
+	if loaded && prev != nil {
+		p.numActiveChans.Add(-1)
+	}
 	p.addedChannels.Delete(chanID)
 }
 

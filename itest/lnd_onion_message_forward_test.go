@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil"
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -40,7 +41,11 @@ type onionMessageTestCase struct {
 // multiple scenarios including forwarding by node ID, by SCID, and with
 // concatenated blinded paths.
 func testOnionMessageForwarding(ht *lntest.HarnessTest) {
-	// Spin up three nodes for the test network.
+	// Spin up three nodes for the test network. Both Alice and Bob need
+	// coins to fund channels with their respective downstream peers
+	// (Alice -> Bob and Bob -> Carol). Onion message ingress is gated on
+	// having at least one fully open channel with the sending peer, so
+	// without these channels every hop would silently drop the message.
 	alice := ht.NewNodeWithCoins("Alice", nil)
 	bob := ht.NewNodeWithCoins("Bob", nil)
 	carol := ht.NewNode("Carol", nil)
@@ -48,6 +53,18 @@ func testOnionMessageForwarding(ht *lntest.HarnessTest) {
 	// Connect nodes so they can share gossip and forward messages.
 	ht.ConnectNodesPerm(alice, bob)
 	ht.ConnectNodesPerm(bob, carol)
+
+	// Open the Alice -> Bob and Bob -> Carol channels up front so that
+	// the channel-presence gate is satisfied at every hop for all of the
+	// forwarding test cases below. The Bob -> Carol channel doubles as
+	// the SCID source for the "forward via scid" test case, which keeps
+	// the per-test setup minimal.
+	ht.OpenChannel(alice, bob, lntest.OpenChannelParams{
+		Amt: btcutil.Amount(100_000),
+	})
+	bobCarolChan := ht.OpenChannel(bob, carol, lntest.OpenChannelParams{
+		Amt: btcutil.Amount(100_000),
+	})
 
 	testCases := []onionMessageTestCase{
 		{
@@ -69,16 +86,10 @@ func testOnionMessageForwarding(ht *lntest.HarnessTest) {
 			setup: func(ht *lntest.HarnessTest, alice, bob,
 				carol *node.HarnessNode) {
 
-				// Open a channel between Bob and Carol so we
-				// have an SCID to use.
-				chanPoint := ht.OpenChannel(
-					bob, carol,
-					lntest.OpenChannelParams{Amt: 100000},
-				)
-
-				// Wait for the channel to be in the graph so
-				// the SCID can be resolved.
-				ht.AssertChannelInGraph(bob, chanPoint)
+				// The Bob -> Carol channel was opened up
+				// front; just wait for it to be in the graph
+				// so the SCID can be resolved.
+				ht.AssertChannelInGraph(bob, bobCarolChan)
 			},
 			buildPath: func(ht *lntest.HarnessTest, alice, bob,
 				carol *node.HarnessNode) (
