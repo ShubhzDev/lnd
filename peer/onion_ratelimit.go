@@ -1,88 +1,72 @@
 package peer
 
 import (
+	"errors"
+
 	"github.com/btcsuite/btclog/v2"
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/onionmessage"
 )
 
-// Drop reason strings shared by allowOnionMessage and logFirstOnionDrop.
-// Keeping them in one place avoids a silent break in the first-drop log if
-// the allowOnionMessage reason text is ever edited.
-const (
-	dropReasonNoChannel   = "peer has no open channel"
-	dropReasonPeerLimit   = "per-peer rate limit exceeded"
-	dropReasonGlobalLimit = "global rate limit exceeded"
-)
+// ErrNoChannel is the sentinel error returned by allowOnionMessage when
+// the incoming peer has no fully open channel with us. It is the
+// primary Sybil-resistance layer on top of the byte-granular rate
+// limiters: an attacker that can cheaply spin up new identities cannot
+// burn any per-peer or global token budget because the channel gate
+// runs before the IngressLimiter is consulted at all.
+var ErrNoChannel = errors.New("peer has no open channel")
 
-// allowOnionMessage applies the configured ingress gates and rate limiters
-// to an incoming onion message of msgBytes bytes and reports whether it
-// should be accepted. The checks run in three stages, cheapest-and-most-
-// discriminating first:
+// allowOnionMessage applies the channel-presence gate and then, if the
+// peer has at least one fully open channel with us, delegates to the
+// IngressLimiter for the per-peer-then-global byte-granular rate limit
+// check. The channel gate runs first on purpose: if it rejects, no rate
+// limiter state is allocated for the no-channel peer and neither bucket
+// is debited. A successful result wraps fn.Unit; a rejection wraps one
+// of the sentinel errors ErrNoChannel,
+// onionmessage.ErrPeerRateLimit, or onionmessage.ErrGlobalRateLimit so
+// that callers can distinguish the drop reason via errors.Is.
 //
-//  1. Channel gate: if hasChannel is false — i.e. the peer has no fully
-//     open channel with us — the message is dropped unconditionally.
-//     This is the primary Sybil-resistance layer: onion message
-//     forwarding is unpaid, so absent a channel requirement an attacker
-//     could spin up arbitrarily many identities and each burn a full
-//     per-peer budget. Requiring a funded channel turns new identities
-//     into a capital cost and flips the Sybil economics on their head.
-//     As a side benefit, no-channel peers never allocate any per-peer
-//     rate limiter state, since the check runs before the limiters.
-//
-//  2. Per-peer rate limiter: bounds the sustained byte rate and burst
-//     this specific peer can push at us.
-//
-//  3. Global rate limiter: bounds the sustained aggregate byte rate
-//     across all peers so that a burst of channel peers cannot
-//     collectively dwarf the node's payment traffic.
-//
-// Each limiter's token bucket holds bytes, not message counts, so
-// msgBytes is the charge against the bucket — small messages pay for
-// less of the budget than spec-max ones. The per-peer limiter is
-// consulted before the global limiter on purpose: if we consulted the
-// global limiter first, a hostile peer whose own per-peer bucket is
-// already empty would still burn global tokens on every rejected attempt,
-// letting a single peer drain the shared budget and starve legitimate
-// peers. By checking the per-peer bucket first, over-limit traffic from
-// one peer is rejected before it can touch the global bucket, and the
-// global bucket only accounts for traffic that was within its source
-// peer's allowance. If the message is rejected the returned string names
-// the gate or limiter that triggered the drop and is suitable for
-// logging. Nil limiter values are treated as "disabled" and always allow
-// the message.
-func allowOnionMessage(global onionmessage.RateLimiter,
-	peer *onionmessage.PeerRateLimiter,
-	peerKey [33]byte, msgBytes int, hasChannel bool) (string, bool) {
+// A nil IngressLimiter is treated as "disabled" and always accepts the
+// message once the channel gate passes. This preserves the behavior of
+// test and disabled-onion-messaging configurations without forcing
+// callers to construct a real limiter.
+func allowOnionMessage(limiter onionmessage.IngressLimiter,
+	peerKey [33]byte, msgBytes int,
+	hasChannel bool) fn.Result[fn.Unit] {
 
 	if !hasChannel {
-		return dropReasonNoChannel, false
+		return fn.Err[fn.Unit](ErrNoChannel)
 	}
-	if peer != nil && !peer.AllowN(peerKey, msgBytes) {
-		return dropReasonPeerLimit, false
-	}
-	if global != nil && !global.AllowN(msgBytes) {
-		return dropReasonGlobalLimit, false
+	if limiter == nil {
+		return fn.Ok(fn.Unit{})
 	}
 
-	return "", true
+	return limiter.AllowN(peerKey, msgBytes)
 }
 
-// logFirstOnionDrop emits a single info-level log line the first time a
-// given limiter trips. Subsequent drops fall through to the caller's debug
-// logging so that operators get a clear "rate limiting is active" signal at
-// info level without the log being flooded under sustained attack.
-func logFirstOnionDrop(log btclog.Logger, reason string,
-	global onionmessage.RateLimiter,
-	peer *onionmessage.PeerRateLimiter) {
+// logFirstOnionDrop emits a single info-level log line the first time
+// the limiter identified by err trips. Subsequent drops fall through to
+// the caller's debug logging so that operators get a clear "rate
+// limiting is active" signal at info level without the log being
+// flooded under sustained attack. The channel-gate drop path does not
+// emit an info-level first-drop line because it is a per-peer policy
+// decision rather than a resource-exhaustion signal.
+func logFirstOnionDrop(log btclog.Logger, err error,
+	limiter onionmessage.IngressLimiter) {
 
-	switch reason {
-	case dropReasonGlobalLimit:
-		if onionmessage.FirstGlobalDropClaim(global) {
+	if limiter == nil {
+		return
+	}
+
+	switch {
+	case errors.Is(err, onionmessage.ErrGlobalRateLimit):
+		if limiter.FirstGlobalDropClaim() {
 			log.Infof("onion message global rate limiter " +
 				"engaged; further drops logged at debug")
 		}
-	case dropReasonPeerLimit:
-		if peer != nil && peer.FirstDropClaim() {
+
+	case errors.Is(err, onionmessage.ErrPeerRateLimit):
+		if limiter.FirstPeerDropClaim() {
 			log.Infof("onion message per-peer rate limiter " +
 				"engaged; further drops logged at debug")
 		}

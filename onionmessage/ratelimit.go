@@ -1,11 +1,27 @@
 package onionmessage
 
 import (
+	"errors"
 	"sync/atomic"
 	"time"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/lnutils"
 	"golang.org/x/time/rate"
+)
+
+var (
+	// ErrPeerRateLimit is the sentinel error returned by
+	// IngressLimiter.AllowN when the per-peer token bucket rejects an
+	// incoming onion message. Callers match on it with errors.Is to
+	// distinguish per-peer drops from global drops.
+	ErrPeerRateLimit = errors.New("per-peer rate limit exceeded")
+
+	// ErrGlobalRateLimit is the sentinel error returned by
+	// IngressLimiter.AllowN when the global token bucket rejects an
+	// incoming onion message. Callers match on it with errors.Is to
+	// distinguish global drops from per-peer drops.
+	ErrGlobalRateLimit = errors.New("global rate limit exceeded")
 )
 
 // kbpsToBytesPerSecond converts a configured kilobits-per-second value into
@@ -222,4 +238,98 @@ func (p *PeerRateLimiter) Dropped() uint64 {
 // adding synchronization on the hot path.
 func (p *PeerRateLimiter) Forget(peer [33]byte) {
 	p.peers.Delete(peer)
+}
+
+// IngressLimiter is the combined per-peer + global rate limiter surface
+// consumed by the onion message ingress path. It hides the split between
+// the two underlying buckets so callers in peer/brontide.go only need to
+// thread a single object through Config and call a single method on every
+// incoming onion message. The per-peer bucket is always checked first so
+// that a hostile peer whose own budget is already empty cannot burn
+// global tokens on every rejected attempt and starve legitimate peers.
+//
+// Implementations must be safe for concurrent use from per-peer
+// readHandler goroutines. A nil IngressLimiter is a valid "disabled"
+// sentinel at call sites and means "accept everything".
+type IngressLimiter interface {
+	// AllowN reports whether an onion message of n bytes from the
+	// given peer is permitted. A successful result wraps fn.Unit; a
+	// rejection wraps either ErrPeerRateLimit or ErrGlobalRateLimit
+	// depending on which bucket fired. Callers use errors.Is against
+	// those sentinels to pick their log / metric / drop path.
+	//
+	// Per-peer state is retained for the lifetime of the process so
+	// that a peer cannot reset its bucket by cycling the connection;
+	// see the PeerRateLimiter doc for the memory-bound argument.
+	AllowN(peer [33]byte, n int) fn.Result[fn.Unit]
+
+	// FirstPeerDropClaim atomically returns true exactly once, on
+	// the first call, and is intended to gate a one-shot info log
+	// when the per-peer limiter first trips.
+	FirstPeerDropClaim() bool
+
+	// FirstGlobalDropClaim atomically returns true exactly once, on
+	// the first call, and is intended to gate a one-shot info log
+	// when the global limiter first trips.
+	FirstGlobalDropClaim() bool
+}
+
+// ingressLimiter is the stock IngressLimiter implementation that
+// composes a PeerRateLimiter with a global RateLimiter. Either side may
+// be nil / disabled independently.
+type ingressLimiter struct {
+	peer   *PeerRateLimiter
+	global RateLimiter
+}
+
+// NewIngressLimiter constructs an IngressLimiter that first consults the
+// given per-peer limiter and then the given global limiter for each
+// incoming onion message. Either argument may be nil (or the zero-value
+// disabled limiter returned by the constructors in this package) in
+// which case that side of the check is skipped.
+func NewIngressLimiter(peer *PeerRateLimiter,
+	global RateLimiter) IngressLimiter {
+
+	return &ingressLimiter{
+		peer:   peer,
+		global: global,
+	}
+}
+
+// AllowN checks per-peer then global, returning the drop reason as a
+// sentinel error wrapped in a fn.Result on rejection. The ordering is
+// load-bearing: consulting the per-peer bucket first means over-limit
+// traffic from one peer is rejected before it can touch the global
+// bucket, so the global bucket only accounts for traffic that was
+// within its source peer's allowance and a single hostile peer cannot
+// drain the shared budget via rejected attempts.
+func (l *ingressLimiter) AllowN(peer [33]byte,
+	n int) fn.Result[fn.Unit] {
+
+	if l.peer != nil && !l.peer.AllowN(peer, n) {
+		return fn.Err[fn.Unit](ErrPeerRateLimit)
+	}
+	if l.global != nil && !l.global.AllowN(n) {
+		return fn.Err[fn.Unit](ErrGlobalRateLimit)
+	}
+
+	return fn.Ok(fn.Unit{})
+}
+
+// FirstPeerDropClaim delegates to the per-peer limiter's one-shot
+// claim. Returns false if the per-peer limiter is nil (disabled).
+func (l *ingressLimiter) FirstPeerDropClaim() bool {
+	if l.peer == nil {
+		return false
+	}
+
+	return l.peer.FirstDropClaim()
+}
+
+// FirstGlobalDropClaim delegates to the global limiter's one-shot
+// claim. Returns false if the global limiter is nil or if the concrete
+// implementation is not a countingLimiter (the noopLimiter returned for
+// a disabled global does not track drops).
+func (l *ingressLimiter) FirstGlobalDropClaim() bool {
+	return FirstGlobalDropClaim(l.global)
 }

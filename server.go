@@ -442,15 +442,14 @@ type server struct {
 		*onionmessage.Request, *onionmessage.Response,
 	]
 
-	// onionGlobalLimiter caps the aggregate rate of incoming onion
-	// messages across all peers, protecting Sphinx CPU, replay-DB writes,
-	// and forwarding bandwidth from a high-volume fan-in.
-	onionGlobalLimiter onionmessage.RateLimiter
-
-	// onionPeerLimiter caps the per-peer rate of incoming onion messages,
-	// preventing any single peer from saturating the global budget on its
-	// own.
-	onionPeerLimiter *onionmessage.PeerRateLimiter
+	// onionLimiter is the combined per-peer + global onion message
+	// ingress limiter. It hides the split between the two underlying
+	// buckets behind a single interface so peer.Config only needs to
+	// carry one field and brontide.readHandler only needs one call
+	// per incoming onion message. Nil means onion message rate
+	// limiting is disabled (e.g. when onion messaging itself is
+	// turned off).
+	onionLimiter onionmessage.IngressLimiter
 
 	// txPublisher is a publisher with fee-bumping capability.
 	txPublisher *sweep.TxPublisher
@@ -2404,19 +2403,25 @@ func (s *server) Start(ctx context.Context) error {
 				DefaultOnionActorOpts()
 
 			// Build the global and per-peer onion message rate
-			// limiters from the configured values. A zero kbps
-			// or a zero burst-bytes disables the corresponding
-			// limiter. Rates are expressed in decimal kilobits
-			// per second and bursts in bytes so that operators
-			// can reason about onion message ingress in terms
-			// of bandwidth rather than raw message counts.
-			s.onionGlobalLimiter = onionmessage.NewGlobalLimiter(
+			// limiters from the configured values, then compose
+			// them behind a single IngressLimiter so the peer
+			// package only needs to carry one field. A zero
+			// kbps or a zero burst-bytes disables the
+			// corresponding bucket; rates are expressed in
+			// decimal kilobits per second and bursts in bytes
+			// so operators can reason about onion message
+			// ingress in terms of bandwidth rather than raw
+			// message counts.
+			onionPeerLim := onionmessage.NewPeerRateLimiter(
+				s.cfg.ProtocolOptions.OnionMsgPeerKbps,
+				s.cfg.ProtocolOptions.OnionMsgPeerBurstBytes,
+			)
+			onionGlobalLim := onionmessage.NewGlobalLimiter(
 				s.cfg.ProtocolOptions.OnionMsgGlobalKbps,
 				s.cfg.ProtocolOptions.OnionMsgGlobalBurstBytes,
 			)
-			s.onionPeerLimiter = onionmessage.NewPeerRateLimiter(
-				s.cfg.ProtocolOptions.OnionMsgPeerKbps,
-				s.cfg.ProtocolOptions.OnionMsgPeerBurstBytes,
+			s.onionLimiter = onionmessage.NewIngressLimiter(
+				onionPeerLim, onionGlobalLim,
 			)
 		}
 
@@ -4487,8 +4492,7 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 		RoutingPolicy:           s.cc.RoutingPolicy,
 		SphinxPayment:           s.sphinxPayment,
 		SpawnOnionActor:         s.onionActorFactory,
-		OnionGlobalLimiter:      s.onionGlobalLimiter,
-		OnionPeerLimiter:        s.onionPeerLimiter,
+		OnionLimiter:            s.onionLimiter,
 		OnionActorOpts: func(_ [33]byte) []actor.ActorOption[
 			*onionmessage.Request, *onionmessage.Response,
 		] {

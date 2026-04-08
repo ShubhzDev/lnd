@@ -315,17 +315,18 @@ type Config struct {
 	// message actor. If nil, onion messaging is disabled.
 	SpawnOnionActor onionmessage.OnionActorFactory
 
-	// OnionGlobalLimiter caps the aggregate rate of incoming onion
-	// messages across all peers. It is consulted after the per-peer
-	// limiter at ingress so that traffic already rejected by its source
-	// peer's own bucket cannot drain the shared budget, and may be a
-	// noop limiter if globally disabled.
-	OnionGlobalLimiter onionmessage.RateLimiter
-
-	// OnionPeerLimiter caps the per-peer rate of incoming onion messages.
-	// Buckets are created lazily on first use and removed when the peer
-	// disconnects.
-	OnionPeerLimiter *onionmessage.PeerRateLimiter
+	// OnionLimiter is the combined per-peer + global onion message
+	// ingress rate limiter. It hides the split between the two
+	// underlying buckets behind a single interface: callers invoke
+	// OnionLimiter.AllowN on every incoming onion message and it
+	// consults the per-peer bucket first (so a hostile peer whose own
+	// budget is empty cannot drain the shared budget on rejected
+	// attempts) and then the global bucket. Per-peer state is retained
+	// across disconnect so a peer cannot reset its bucket by cycling
+	// the connection; see the PeerRateLimiter doc for the memory-bound
+	// argument. A nil value means onion message rate limiting is
+	// disabled.
+	OnionLimiter onionmessage.IngressLimiter
 
 	// OnionActorOpts returns ActorOptions for the onion peer actor
 	// being spawned for the given peer. This allows per-peer
@@ -1756,22 +1757,14 @@ func (p *Brontide) Disconnect(reason error) {
 	// Stop the onion peer actor if one was spawned.
 	p.StopOnionActorIfExists()
 
-	// Evict this peer's bucket from the per-peer onion message rate
-	// limiter so the registry's memory footprint stays bounded across
-	// the lifetime of the process. This is racy with in-flight Allow
-	// calls from the still-draining readHandler: if one wins the race
-	// after the Forget, it will re-insert a fresh bucket. The orphan is
-	// bounded to a single entry per peer and is reaped on the next
-	// reconnect-then-disconnect cycle, so we tolerate it rather than
-	// adding additional synchronization on the hot path.
-	//
-	// Note that because Forget drops the bucket, a peer that cycles
-	// disconnect/reconnect rapidly can amplify its effective per-peer
-	// rate: each reconnect yields a fresh full-burst bucket. The global
-	// limiter is the hard ceiling that guards against this.
-	if p.cfg.OnionPeerLimiter != nil {
-		p.cfg.OnionPeerLimiter.Forget(p.PubKey())
-	}
+	// Note: we deliberately do not evict this peer's bucket from the
+	// per-peer onion message rate limiter on disconnect. Retaining it
+	// is what makes the per-peer rate a real ceiling: a peer that
+	// drained its burst cannot reset the bucket by cycling the
+	// connection. The memory cost is bounded by the number of channel
+	// peers that have ever sent an onion message (the ingress site
+	// gates AllowN on having an open channel before touching the
+	// registry); see the PeerRateLimiter doc for the full argument.
 
 	// Ensure that the TCP connection is properly closed before continuing.
 	p.cfg.Conn.Close()
@@ -2380,20 +2373,19 @@ out:
 			// actual ingress bandwidth rather than raw message
 			// counts. The channel-gate hint is sourced from the
 			// atomic active-channel counter so the check is
-			// O(1) on the hot path.
-			if reason, ok := allowOnionMessage(
-				p.cfg.OnionGlobalLimiter,
-				p.cfg.OnionPeerLimiter,
-				p.PubKey(), msg.WireSize(),
-				p.hasActiveChannels(),
-			); !ok {
+			// O(1) on the hot path. A rejection surfaces as a
+			// sentinel error wrapped in fn.Result; errors.Is
+			// lets us pick the right first-drop log path.
+			result := allowOnionMessage(
+				p.cfg.OnionLimiter, p.PubKey(),
+				msg.WireSize(), p.hasActiveChannels(),
+			)
+			if err := result.Err(); err != nil {
 				logFirstOnionDrop(
-					p.log, reason,
-					p.cfg.OnionGlobalLimiter,
-					p.cfg.OnionPeerLimiter,
+					p.log, err, p.cfg.OnionLimiter,
 				)
-				p.log.Debugf("dropping onion message: %s",
-					reason)
+				p.log.Debugf("dropping onion message: %v",
+					err)
 
 				break
 			}

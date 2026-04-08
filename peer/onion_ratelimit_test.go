@@ -1,10 +1,12 @@
 package peer
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/onionmessage"
 	"github.com/stretchr/testify/require"
 )
@@ -14,170 +16,215 @@ import (
 // that burst budgets scale naturally with the per-message cost.
 const testMsgBytes = 32 * 1024
 
-// stubGlobalLimiter is a RateLimiter whose AllowN result is controlled by
-// a caller-supplied function. It is used to exercise the global-rejection
-// branch of allowOnionMessage without needing a real token bucket.
-type stubGlobalLimiter struct {
-	allow func() bool
+// stubIngressLimiter is a test double for onionmessage.IngressLimiter
+// that records every call and delegates the accept/reject decision to a
+// caller-supplied predicate. It is used to exercise allowOnionMessage's
+// composition logic (channel gate → limiter) without standing up a
+// real token bucket.
+type stubIngressLimiter struct {
+	// decide is invoked for every AllowN call. It receives the peer
+	// key and byte count and returns the error to embed in the
+	// fn.Result — nil for accept.
+	decide func(peer [33]byte, n int) error
+
 	calls atomic.Uint64
 }
 
 // AllowN records the call and dispatches to the configured predicate.
-func (s *stubGlobalLimiter) AllowN(_ int) bool {
+func (s *stubIngressLimiter) AllowN(peer [33]byte,
+	n int) fn.Result[fn.Unit] {
+
 	s.calls.Add(1)
-	return s.allow()
+	if err := s.decide(peer, n); err != nil {
+		return fn.Err[fn.Unit](err)
+	}
+
+	return fn.Ok(fn.Unit{})
 }
 
-// TestAllowOnionMessageNilLimiters verifies that allowOnionMessage treats nil
-// limiter values as "disabled" and unconditionally accepts messages.
-func TestAllowOnionMessageNilLimiters(t *testing.T) {
+// FirstPeerDropClaim always returns true so the log-path test can
+// observe the one-shot dispatch. Tests that care about the one-shot
+// invariant use a real IngressLimiter instead.
+func (s *stubIngressLimiter) FirstPeerDropClaim() bool { return true }
+
+// FirstGlobalDropClaim always returns true for the same reason.
+func (s *stubIngressLimiter) FirstGlobalDropClaim() bool { return true }
+
+// acceptAll constructs a stubIngressLimiter whose AllowN always accepts.
+func acceptAll() *stubIngressLimiter {
+	return &stubIngressLimiter{
+		decide: func(_ [33]byte, _ int) error { return nil },
+	}
+}
+
+// TestAllowOnionMessageNilLimiter verifies that allowOnionMessage treats
+// a nil IngressLimiter as "disabled" and unconditionally accepts
+// messages, as long as the channel gate passes.
+func TestAllowOnionMessageNilLimiter(t *testing.T) {
 	t.Parallel()
 
 	var peer [33]byte
-	reason, ok := allowOnionMessage(nil, nil, peer, testMsgBytes, true)
-	require.True(t, ok)
-	require.Empty(t, reason)
+	result := allowOnionMessage(nil, peer, testMsgBytes, true)
+	require.NoError(t, result.Err())
 }
 
-// TestAllowOnionMessageNoChannel verifies that messages from a peer that
-// does not have a fully open channel with us are dropped unconditionally
-// with the no-channel drop reason. This is the primary Sybil-resistance
-// layer: an attacker that can cheaply spin up new identities is unable
-// to burn any per-peer or global token budget since the gate runs before
-// either limiter is consulted. The test also asserts that neither
-// limiter is touched on a no-channel drop — no global call counter
-// ticks, and the per-peer limiter does not allocate a bucket for the
-// rejected peer.
+// TestAllowOnionMessageNoChannel verifies that messages from a peer
+// that does not have a fully open channel with us are dropped
+// unconditionally with ErrNoChannel, even when a real IngressLimiter
+// is configured. The stub records whether AllowN was consulted; it
+// must remain at zero to prove the channel gate runs before the
+// IngressLimiter.
 func TestAllowOnionMessageNoChannel(t *testing.T) {
 	t.Parallel()
 
-	// A global limiter that would accept traffic if consulted — if it
-	// records any call at all, the gate was skipped.
-	global := &stubGlobalLimiter{allow: func() bool { return true }}
-	// A per-peer limiter with plenty of headroom so that exhaustion
-	// cannot explain any rejection we see.
-	peer := onionmessage.NewPeerRateLimiter(1_000_000, 100*testMsgBytes)
+	limiter := acceptAll()
 
 	var key [33]byte
 	key[0] = 0x07
 
-	// With hasChannel=false the gate must reject immediately.
-	reason, ok := allowOnionMessage(
-		global, peer, key, testMsgBytes, false,
-	)
-	require.False(t, ok)
-	require.Equal(t, "peer has no open channel", reason)
+	result := allowOnionMessage(limiter, key, testMsgBytes, false)
+	require.Error(t, result.Err())
+	require.True(t, errors.Is(result.Err(), ErrNoChannel))
+	require.Equal(t, uint64(0), limiter.calls.Load(),
+		"no-channel drop must not consult the IngressLimiter")
 
-	// Neither limiter must have been touched: the global stub's call
-	// counter must still be zero and the per-peer limiter must not
-	// have recorded a drop or created a bucket for this key.
-	require.Equal(t, uint64(0), global.calls.Load(),
-		"no-channel drop must not consult the global limiter")
-	require.Equal(t, uint64(0), peer.Dropped(),
-		"no-channel drop must not consult the per-peer limiter")
-
-	// Once a channel comes into existence (simulated here by flipping
-	// the hasChannel flag), the same key must be allowed through and
-	// both limiters should now be consulted.
-	reason, ok = allowOnionMessage(
-		global, peer, key, testMsgBytes, true,
-	)
-	require.True(t, ok)
-	require.Empty(t, reason)
-	require.Equal(t, uint64(1), global.calls.Load())
+	// Once the channel gate flips, the same key is accepted and the
+	// limiter is now consulted exactly once.
+	result = allowOnionMessage(limiter, key, testMsgBytes, true)
+	require.NoError(t, result.Err())
+	require.Equal(t, uint64(1), limiter.calls.Load())
 }
 
-// TestAllowOnionMessagePeerRejectsFirst verifies that the per-peer limiter
-// is consulted before the global limiter so that a hostile peer whose own
-// bucket is already empty cannot burn global tokens on every rejected
-// attempt and starve legitimate peers of the shared budget.
+// TestAllowOnionMessagePeerRejectsFirst verifies that a real
+// IngressLimiter consults the per-peer limiter before the global
+// limiter: once the per-peer bucket is drained, the global bucket
+// must not be touched on subsequent calls, preserving the shared
+// budget against a hostile peer burning global tokens via rejected
+// attempts.
 func TestAllowOnionMessagePeerRejectsFirst(t *testing.T) {
 	t.Parallel()
 
-	global := &stubGlobalLimiter{allow: func() bool { return true }}
-	// Very low rate + burst exactly one message guarantees the second
-	// call is rejected within the test window.
-	peer := onionmessage.NewPeerRateLimiter(1, testMsgBytes)
+	// Real per-peer limiter with burst of exactly one message; very
+	// low rate so it does not refill during the test.
+	peerLim := onionmessage.NewPeerRateLimiter(1, testMsgBytes)
+
+	// Stub "global" that records whether it was consulted. It wraps
+	// the global side of the IngressLimiter.
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return true },
+		calls: &globalCalls,
+	}
+
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
 
 	var key [33]byte
 	key[0] = 0x03
 
-	// First call consumes the single burst token. Both limiters are
-	// consulted because the per-peer check passes and the code falls
-	// through to the global check.
-	reason, ok := allowOnionMessage(
-		global, peer, key, testMsgBytes, true,
-	)
-	require.True(t, ok)
-	require.Empty(t, reason)
-	require.Equal(t, uint64(1), global.calls.Load())
+	// First call drains the per-peer bucket; both limiters are
+	// consulted so global.calls bumps to 1.
+	result := allowOnionMessage(limiter, key, testMsgBytes, true)
+	require.NoError(t, result.Err())
+	require.Equal(t, uint64(1), globalCalls.Load())
 
-	// Second call should trip the per-peer limiter and must not consult
-	// the global limiter at all, preserving the global budget.
-	reason, ok = allowOnionMessage(
-		global, peer, key, testMsgBytes, true,
+	// Second call trips the per-peer limiter and must NOT consult
+	// the global limiter — globalCalls stays at 1.
+	result = allowOnionMessage(limiter, key, testMsgBytes, true)
+	require.Error(t, result.Err())
+	require.True(t,
+		errors.Is(result.Err(), onionmessage.ErrPeerRateLimit),
 	)
-	require.False(t, ok)
-	require.Equal(t, "per-peer rate limit exceeded", reason)
-	require.Equal(t, uint64(1), peer.Dropped())
-	require.Equal(t, uint64(1), global.calls.Load(),
+	require.Equal(t, uint64(1), peerLim.Dropped())
+	require.Equal(t, uint64(1), globalCalls.Load(),
 		"global limiter must not be consulted when per-peer rejects")
 }
 
-// TestAllowOnionMessageGlobalRejects verifies that when the per-peer limiter
-// permits traffic but the global bucket is exhausted, allowOnionMessage
-// reports the global drop reason.
+// countingGlobalStub is a minimal RateLimiter test double that counts
+// calls to AllowN and delegates the accept/reject decision to a
+// caller-supplied predicate. It exists so tests can feed a real
+// ingressLimiter a controllable global side.
+type countingGlobalStub struct {
+	allow func() bool
+	calls *atomic.Uint64
+}
+
+func (s *countingGlobalStub) AllowN(_ int) bool {
+	s.calls.Add(1)
+
+	return s.allow()
+}
+
+// TestAllowOnionMessageGlobalRejects verifies that when the per-peer
+// limiter permits traffic but the global bucket is exhausted,
+// allowOnionMessage surfaces ErrGlobalRateLimit.
 func TestAllowOnionMessageGlobalRejects(t *testing.T) {
 	t.Parallel()
 
-	global := &stubGlobalLimiter{allow: func() bool { return false }}
-	peer := onionmessage.NewPeerRateLimiter(1_000_000, 100*testMsgBytes)
+	peerLim := onionmessage.NewPeerRateLimiter(
+		1_000_000, 100*testMsgBytes,
+	)
+
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return false },
+		calls: &globalCalls,
+	}
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
 
 	var key [33]byte
 	key[0] = 0x02
 
-	reason, ok := allowOnionMessage(
-		global, peer, key, testMsgBytes, true,
+	result := allowOnionMessage(limiter, key, testMsgBytes, true)
+	require.Error(t, result.Err())
+	require.True(t,
+		errors.Is(result.Err(), onionmessage.ErrGlobalRateLimit),
 	)
-	require.False(t, ok)
-	require.Equal(t, "global rate limit exceeded", reason)
-
-	// The per-peer limiter is consulted first and allows the message,
-	// consuming one of its tokens, before the global rejects it.
-	require.Equal(t, uint64(0), peer.Dropped())
-	require.Equal(t, uint64(1), global.calls.Load())
+	require.Equal(t, uint64(0), peerLim.Dropped())
+	require.Equal(t, uint64(1), globalCalls.Load())
 }
 
-// TestAllowOnionMessageHappyPath verifies that when both limiters permit the
-// traffic, the helper returns ok with an empty reason.
+// TestAllowOnionMessageHappyPath verifies that a fully-configured
+// IngressLimiter accepts a stream of messages when neither bucket is
+// under pressure.
 func TestAllowOnionMessageHappyPath(t *testing.T) {
 	t.Parallel()
 
-	global := &stubGlobalLimiter{allow: func() bool { return true }}
-	peer := onionmessage.NewPeerRateLimiter(1_000_000, 100*testMsgBytes)
+	peerLim := onionmessage.NewPeerRateLimiter(
+		1_000_000, 100*testMsgBytes,
+	)
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return true },
+		calls: &globalCalls,
+	}
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
 
 	var key [33]byte
 	key[0] = 0x04
 
 	for i := 0; i < 10; i++ {
-		reason, ok := allowOnionMessage(
-			global, peer, key, testMsgBytes, true,
+		result := allowOnionMessage(
+			limiter, key, testMsgBytes, true,
 		)
-		require.True(t, ok, "iter %d", i)
-		require.Empty(t, reason)
+		require.NoError(t, result.Err(), "iter %d", i)
 	}
-	require.Equal(t, uint64(0), peer.Dropped())
+	require.Equal(t, uint64(0), peerLim.Dropped())
 }
 
-// TestAllowOnionMessagePeerIsolation verifies at the peer-package level that
-// exhausting one peer's bucket through allowOnionMessage does not affect a
-// different peer's allowance — guarding against a regression where the
-// helper might key the bucket incorrectly.
+// TestAllowOnionMessagePeerIsolation verifies at the peer-package level
+// that exhausting one peer's bucket through allowOnionMessage does not
+// affect a different peer's allowance — guarding against a regression
+// where the helper might key the bucket incorrectly.
 func TestAllowOnionMessagePeerIsolation(t *testing.T) {
 	t.Parallel()
 
-	global := &stubGlobalLimiter{allow: func() bool { return true }}
-	peer := onionmessage.NewPeerRateLimiter(1, 2*testMsgBytes)
+	peerLim := onionmessage.NewPeerRateLimiter(1, 2*testMsgBytes)
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return true },
+		calls: &globalCalls,
+	}
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
 
 	var keyA, keyB [33]byte
 	keyA[0] = 0x02
@@ -185,36 +232,41 @@ func TestAllowOnionMessagePeerIsolation(t *testing.T) {
 
 	// Drain peer A.
 	for i := 0; i < 2; i++ {
-		_, ok := allowOnionMessage(
-			global, peer, keyA, testMsgBytes, true,
+		result := allowOnionMessage(
+			limiter, keyA, testMsgBytes, true,
 		)
-		require.True(t, ok)
+		require.NoError(t, result.Err())
 	}
-	_, ok := allowOnionMessage(
-		global, peer, keyA, testMsgBytes, true,
-	)
-	require.False(t, ok)
+	result := allowOnionMessage(limiter, keyA, testMsgBytes, true)
+	require.Error(t, result.Err())
 
 	// Peer B must still have its full burst available.
 	for i := 0; i < 2; i++ {
-		_, ok := allowOnionMessage(
-			global, peer, keyB, testMsgBytes, true,
+		result := allowOnionMessage(
+			limiter, keyB, testMsgBytes, true,
 		)
-		require.True(t, ok, "peer B slot %d", i)
+		require.NoError(t, result.Err(), "peer B slot %d", i)
 	}
 }
 
 // TestAllowOnionMessageConcurrent exercises concurrent access to
 // allowOnionMessage across many goroutines. It asserts that the sum of
-// accepted calls plus the per-peer dropped counter equals the total number
-// of attempts, and that no race or panic occurs. Run with -race for the
-// strongest signal.
+// accepted calls plus the per-peer dropped counter equals the total
+// number of attempts, and that no race or panic occurs. Run with -race
+// for the strongest signal.
 func TestAllowOnionMessageConcurrent(t *testing.T) {
 	t.Parallel()
 
-	global := &stubGlobalLimiter{allow: func() bool { return true }}
 	const burstMessages = 32
-	peer := onionmessage.NewPeerRateLimiter(1, burstMessages*testMsgBytes)
+	peerLim := onionmessage.NewPeerRateLimiter(
+		1, burstMessages*testMsgBytes,
+	)
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return true },
+		calls: &globalCalls,
+	}
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
 
 	var key [33]byte
 	key[0] = 0x05
@@ -229,10 +281,10 @@ func TestAllowOnionMessageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				if _, ok := allowOnionMessage(
-					global, peer, key, testMsgBytes,
-					true,
-				); ok {
+				result := allowOnionMessage(
+					limiter, key, testMsgBytes, true,
+				)
+				if result.Err() == nil {
 					accepted.Add(1)
 				}
 			}
@@ -242,11 +294,85 @@ func TestAllowOnionMessageConcurrent(t *testing.T) {
 
 	total := uint64(workers * perWorker)
 	require.Equal(
-		t, total, accepted.Load()+peer.Dropped(),
+		t, total, accepted.Load()+peerLim.Dropped(),
 		"every attempt must be counted as accepted or dropped",
 	)
 	// With a near-zero refill rate the bucket can only issue at most
 	// burstMessages accepts before refill; since the test runs much
-	// faster than the refill interval, accepted should equal the burst.
+	// faster than the refill interval, accepted should equal the
+	// burst.
 	require.Equal(t, uint64(burstMessages), accepted.Load())
+}
+
+// TestAllowOnionMessageBucketSurvivesDisconnect verifies the deliberate
+// no-eviction-on-disconnect policy: after a peer drains its per-peer burst
+// and "disconnects", the bucket is retained so subsequent messages from the
+// same peer are still rejected. Without retention a peer could cycle the
+// connection to get a fresh burst on every reconnect, effectively bypassing
+// the per-peer rate ceiling.
+func TestAllowOnionMessageBucketSurvivesDisconnect(t *testing.T) {
+	t.Parallel()
+
+	const burstMessages = 2
+	peerLim := onionmessage.NewPeerRateLimiter(1,
+		burstMessages*testMsgBytes,
+	)
+	globalCalls := atomic.Uint64{}
+	global := &countingGlobalStub{
+		allow: func() bool { return true },
+		calls: &globalCalls,
+	}
+	limiter := onionmessage.NewIngressLimiter(peerLim, global)
+
+	var key [33]byte
+	key[0] = 0x09
+
+	// Drain the per-peer burst through the full allowOnionMessage path.
+	for i := 0; i < burstMessages; i++ {
+		result := allowOnionMessage(
+			limiter, key, testMsgBytes, true,
+		)
+		require.NoError(t, result.Err(), "burst slot %d", i)
+	}
+
+	// Confirm the peer is now rate-limited.
+	result := allowOnionMessage(limiter, key, testMsgBytes, true)
+	require.Error(t, result.Err())
+	require.True(t,
+		errors.Is(result.Err(), onionmessage.ErrPeerRateLimit),
+	)
+
+	// Simulate disconnect: Brontide.Disconnect deliberately does NOT
+	// call Forget on the per-peer limiter. We mirror that here by
+	// doing nothing — the bucket must survive.
+
+	// On "reconnect" the same peer should still be rate-limited
+	// because the bucket was not evicted.
+	for i := 0; i < 5; i++ {
+		result = allowOnionMessage(
+			limiter, key, testMsgBytes, true,
+		)
+		require.Error(t, result.Err(),
+			"post-disconnect attempt %d must still be rejected", i,
+		)
+		require.True(t,
+			errors.Is(
+				result.Err(),
+				onionmessage.ErrPeerRateLimit,
+			),
+		)
+	}
+
+	// Meanwhile a different peer should have a fresh, full burst,
+	// proving the rejection is per-peer and not a global artifact.
+	var otherKey [33]byte
+	otherKey[0] = 0x0A
+	for i := 0; i < burstMessages; i++ {
+		result = allowOnionMessage(
+			limiter, otherKey, testMsgBytes, true,
+		)
+		require.NoError(t, result.Err(),
+			"other peer slot %d", i,
+		)
+	}
 }
