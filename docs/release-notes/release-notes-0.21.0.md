@@ -106,7 +106,8 @@
   protocol state machine and invalidating nonces after each signing round
   completes.
 
-* Added per-peer and global rate limiters for incoming onion messages. The
+* [Added per-peer and global rate limiters for incoming onion
+  messages](https://github.com/lightningnetwork/lnd/pull/10713). The
   existing per-peer mailbox + RED only bounds in-flight queue depth, leaving
   unpaid forwarded onion message traffic unbounded in throughput. Two new
   token-bucket limiters now drop traffic at ingress before it reaches the
@@ -123,21 +124,21 @@
   burst of a given limiter to `0` disables that limiter entirely, while
   setting one to `0` with the other positive, or setting a burst smaller
   than a single maximum-sized wire message, is rejected at startup as a
-  configuration error.
-
-* Incoming onion messages from peers that have no fully open channel with
-  us are now dropped at ingress before the rate limiters are consulted.
-  Without this gate, onion message forwarding is an unpaid side channel
-  that a Sybil attacker can exploit by spinning up arbitrarily many
-  no-cost identities and burning a full per-peer byte budget on each —
-  the global limiter alone cannot prevent service denial because the
-  shared bucket is quickly saturated. Requiring a funded channel turns
-  new identities into a real capital cost and flips the Sybil economics.
-  Pending channels are intentionally excluded from the gate because they
-  are cheap to open and prone to getting stuck, and so do not provide
-  the guarantee. The check is O(1) on the hot path via an atomic
-  active-channel counter maintained alongside the per-peer channel
-  registry, so it adds no measurable cost to the ingress pipeline.
+  configuration error. As a complementary Sybil-resistance layer,
+  incoming onion messages from peers that do not have at least one
+  fully open channel with us are now dropped at ingress before either
+  limiter is consulted. Without this gate, onion message forwarding is
+  an unpaid side channel that a Sybil attacker can exploit by spinning
+  up arbitrarily many no-cost identities and burning a full per-peer
+  byte budget on each — the global limiter alone cannot prevent service
+  denial because the shared bucket is quickly saturated. Requiring a
+  funded channel turns new identities into a real capital cost and
+  flips the Sybil economics. Pending channels are intentionally
+  excluded from the gate because they are cheap to open and prone to
+  getting stuck, and so do not provide the guarantee. The check is
+  O(1) on the hot path via an atomic active-channel counter maintained
+  alongside the per-peer channel registry, so it adds no measurable
+  cost to the ingress pipeline.
 
 ## RPC Additions
 
