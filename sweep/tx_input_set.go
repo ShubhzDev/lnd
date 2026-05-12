@@ -12,6 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwallet/chanfunding"
 )
 
 var (
@@ -35,9 +36,13 @@ type InputSet interface {
 	Inputs() []input.Input
 
 	// AddWalletInputs adds wallet inputs to the set until a non-dust
-	// change output can be made. Return an error if there are not enough
-	// wallet inputs.
-	AddWalletInputs(wallet Wallet) error
+	// change output can be made. Outpoints listed in excludeUtxos
+	// are skipped, which lets the caller prevent the same wallet
+	// UTXO from being picked by multiple sets in the same tick. The
+	// outpoints that were leased and added are returned so the
+	// caller can release them if the surrounding sweep fails.
+	AddWalletInputs(wallet Wallet,
+		excludeUtxos fn.Set[wire.OutPoint]) ([]wire.OutPoint, error)
 
 	// NeedWalletInput returns true if the input set needs more wallet
 	// inputs.
@@ -347,7 +352,13 @@ func (b *BudgetInputSet) hasNormalInput() bool {
 // set to its initial state by removing any wallet inputs added.
 //
 // NOTE: must be called with the wallet lock held via `WithCoinSelectLock`.
-func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
+func (b *BudgetInputSet) AddWalletInputs(wallet Wallet,
+	excludeUtxos fn.Set[wire.OutPoint]) ([]wire.OutPoint, error) {
+
+	// Track wallet outpoints we lease and add. Returned to the caller
+	// even on error so they can be released if the sweep fails.
+	var addedOPs []wire.OutPoint
+
 	// Retrieve wallet utxos. Only consider confirmed utxos to prevent
 	// problems around RBF rules for unconfirmed inputs. This currently
 	// ignores the configured coin selection strategy.
@@ -355,7 +366,7 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 		1, math.MaxInt32,
 	)
 	if err != nil {
-		return fmt.Errorf("list unspent witness: %w", err)
+		return nil, fmt.Errorf("list unspent witness: %w", err)
 	}
 
 	// Sort the UTXOs by putting smaller values at the start of the slice
@@ -369,20 +380,45 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 
 	// Add wallet inputs to the set until the specified budget is covered.
 	for _, utxo := range utxos {
-		err := b.addWalletInput(utxo)
-		if err != nil {
-			return err
+		// Skip UTXOs already claimed by another set in this tick.
+		if excludeUtxos.Contains(utxo.OutPoint) {
+			log.Debugf("Skipping wallet UTXO %v: already used "+
+				"by another sweep set", utxo.OutPoint)
+			continue
 		}
+
+		// Lease the output so it can't be picked by another
+		// subsystem (e.g. channel funding) while the sweep is in
+		// flight.
+		_, err := wallet.LeaseOutput(
+			SweeperLockID,
+			utxo.OutPoint,
+			chanfunding.DefaultLockDuration,
+		)
+		if err != nil {
+			return addedOPs, fmt.Errorf("lease output %v:%w",
+				utxo.OutPoint, err)
+		}
+
+		// If adding to the set fails, release the lease we just
+		// took so we don't leak a locked output.
+		err = b.addWalletInput(utxo)
+		if err != nil {
+			_ = wallet.ReleaseOutput(SweeperLockID, utxo.OutPoint)
+			return addedOPs, err
+		}
+
+		addedOPs = append(addedOPs, utxo.OutPoint)
 
 		// Return if we've reached the minimum output amount.
 		if !b.NeedWalletInput() {
-			return nil
+			return addedOPs, nil
 		}
 	}
 
 	// Exit if there are no inputs can contribute to the fees.
 	if !b.hasNormalInput() {
-		return ErrNotEnoughInputs
+		return addedOPs, ErrNotEnoughInputs
 	}
 
 	// If there's at least one input that can contribute to fees, we allow
@@ -395,7 +431,7 @@ func (b *BudgetInputSet) AddWalletInputs(wallet Wallet) error {
 		"total=%v, missing at least %v, sweeping anyway...", budget,
 		spendable, total, budget-spendable)
 
-	return nil
+	return addedOPs, nil
 }
 
 // Budget returns the total budget of the set.

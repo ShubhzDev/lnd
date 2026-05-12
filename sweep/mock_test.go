@@ -1,9 +1,12 @@
 package sweep
 
 import (
+	"time"
+
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -109,6 +112,16 @@ type MockWallet struct {
 	mock.Mock
 }
 
+func (m *MockWallet) LeaseOutput(id wtxmgr.LockID, op wire.OutPoint, duration time.Duration) (time.Time, error) {
+	args := m.Called(id, op, duration)
+	return args.Get(0).(time.Time), args.Error(1)
+}
+
+func (m *MockWallet) ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error {
+	args := m.Called(id, op)
+	return args.Error(0)
+}
+
 // Compile-time constraint to ensure MockWallet implements Wallet.
 var _ Wallet = (*MockWallet)(nil)
 
@@ -209,6 +222,17 @@ type MockInputSet struct {
 	mock.Mock
 }
 
+func (m *MockInputSet) AddWalletInputs(wallet Wallet,
+	usedUtxos fn.Set[wire.OutPoint]) ([]wire.OutPoint, error) {
+
+	args := m.Called(wallet, usedUtxos)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]wire.OutPoint), args.Error(1)
+}
+
 // Compile-time constraint to ensure MockInputSet implements InputSet.
 var _ InputSet = (*MockInputSet)(nil)
 
@@ -228,15 +252,6 @@ func (m *MockInputSet) FeeRate() chainfee.SatPerKWeight {
 	args := m.Called()
 
 	return args.Get(0).(chainfee.SatPerKWeight)
-}
-
-// AddWalletInputs adds wallet inputs to the set until a non-dust
-// change output can be made. Return an error if there are not enough
-// wallet inputs.
-func (m *MockInputSet) AddWalletInputs(wallet Wallet) error {
-	args := m.Called(wallet)
-
-	return args.Error(0)
 }
 
 // NeedWalletInput returns true if the input set needs more wallet

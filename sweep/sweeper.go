@@ -1587,13 +1587,21 @@ func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
 	// Cluster all of our inputs based on the specific Aggregator.
 	sets := s.cfg.Aggregator.ClusterInputs(inputs)
 
+	// Track wallet outpoints claimed in this tick so the next set
+	// skips them. ListUnspent doesn't filter leased outputs, so we
+	// need this in-memory accounting.
+	usedUtxos := fn.NewSet[wire.OutPoint]()
+
 	// sweepWithLock is a helper closure that executes the sweep within a
 	// coin select lock to prevent the coins being selected for other
 	// transactions like funding of a channel.
-	sweepWithLock := func(set InputSet) error {
-		return s.cfg.Wallet.WithCoinSelectLock(func() error {
+	sweepWithLock := func(set InputSet) ([]wire.OutPoint, error) {
+		var walletOPs []wire.OutPoint
+
+		err := s.cfg.Wallet.WithCoinSelectLock(func() error {
 			// Try to add inputs from our wallet.
-			err := set.AddWalletInputs(s.cfg.Wallet)
+			ops, err := set.AddWalletInputs(s.cfg.Wallet, usedUtxos)
+			walletOPs = ops
 			if err != nil {
 				return err
 			}
@@ -1606,13 +1614,19 @@ func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
 
 			return nil
 		})
+
+		return walletOPs, err
 	}
 
 	for _, set := range sets {
-		var err error
+		var (
+			err       error
+			walletOPs []wire.OutPoint
+		)
+
 		if set.NeedWalletInput() {
 			// Sweep the set of inputs that need the wallet inputs.
-			err = sweepWithLock(set)
+			walletOPs, err = sweepWithLock(set)
 		} else {
 			// Sweep the set of inputs that don't need the wallet
 			// inputs.
@@ -1621,6 +1635,24 @@ func (s *UtxoSweeper) sweepPendingInputs(inputs InputsMap) {
 
 		if err != nil {
 			log.Errorf("Failed to sweep %v: %v", set, err)
+
+			// Release any leases we took while building this
+			// sweep so the coins are available again.
+			for _, op := range walletOPs {
+				rErr := s.cfg.Wallet.ReleaseOutput(
+					SweeperLockID, op,
+				)
+				if rErr != nil {
+					log.Warnf("Failed to release lease for "+
+						"%v: %v", op, rErr)
+				}
+			}
+			continue
+		}
+
+		// Record the claimed outpoints so the next set skips them.
+		for _, op := range walletOPs {
+			usedUtxos.Add(op)
 		}
 	}
 }

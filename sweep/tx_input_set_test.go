@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -11,6 +12,7 @@ import (
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -411,7 +413,7 @@ func TestAddWalletInputsReturnErr(t *testing.T) {
 
 	// Check that the error is returned from
 	// ListUnspentWitnessFromDefaultAccount.
-	err := set.AddWalletInputs(wallet)
+	_, err := set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.ErrorIs(t, err, dummyErr)
 
 	// Create an utxo with unknown address type to trigger an error.
@@ -423,8 +425,17 @@ func TestAddWalletInputsReturnErr(t *testing.T) {
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
 		min, max).Return([]*lnwallet.Utxo{utxo}, nil).Once()
 
+	// The production code now leases the UTXO before adding it,
+	// and releases it on add failure.
+	wallet.On(
+		"LeaseOutput", mock.Anything, utxo.OutPoint, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Once()
+	wallet.On(
+		"ReleaseOutput", mock.Anything, utxo.OutPoint,
+	).Return(nil).Once()
+
 	// Check that the error is returned from createWalletTxInput.
-	err = set.AddWalletInputs(wallet)
+	_, err = set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.Error(t, err)
 
 	// Mock the wallet to return empty utxos.
@@ -432,7 +443,7 @@ func TestAddWalletInputsReturnErr(t *testing.T) {
 		min, max).Return([]*lnwallet.Utxo{}, nil).Once()
 
 	// Check that the error is returned from not having wallet inputs.
-	err = set.AddWalletInputs(wallet)
+	_, err = set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.ErrorIs(t, err, ErrNotEnoughInputs)
 }
 
@@ -479,12 +490,17 @@ func TestAddWalletInputsNotEnoughInputs(t *testing.T) {
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
 		min, max).Return([]*lnwallet.Utxo{utxo}, nil).Once()
 
+	// The production code leases the UTXO before adding it.
+	wallet.On(
+		"LeaseOutput", mock.Anything, utxo.OutPoint, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Once()
+
 	// Initialize an input set with the pending input.
 	set := BudgetInputSet{inputs: []*SweeperInput{pi}}
 
 	// Add wallet inputs to the input set, which should return no error
 	// although the wallet cannot cover the budget.
-	err := set.AddWalletInputs(wallet)
+	_, err := set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.NoError(t, err)
 
 	// Check that the budget set is updated.
@@ -552,7 +568,7 @@ func TestAddWalletInputsEmptyWalletSuccess(t *testing.T) {
 
 	// Add wallet inputs to the input set, which should return no error
 	// although the wallet is empty.
-	err := set.AddWalletInputs(wallet)
+	_, err := set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.NoError(t, err)
 }
 
@@ -603,6 +619,11 @@ func TestAddWalletInputsSuccess(t *testing.T) {
 	wallet.On("ListUnspentWitnessFromDefaultAccount",
 		min, max).Return([]*lnwallet.Utxo{utxo, utxo}, nil).Once()
 
+	// Each picked UTXO is leased.
+	wallet.On(
+		"LeaseOutput", mock.Anything, utxo.OutPoint, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Twice()
+
 	// Initialize an input set with the pending input.
 	set, err := NewBudgetInputSet(
 		[]SweeperInput{*pi}, deadline, fn.None[AuxSweeper](),
@@ -611,7 +632,7 @@ func TestAddWalletInputsSuccess(t *testing.T) {
 
 	// Add wallet inputs to the input set, which should give us an error as
 	// the wallet cannot cover the budget.
-	err = set.AddWalletInputs(wallet)
+	_, err = set.AddWalletInputs(wallet, fn.NewSet[wire.OutPoint]())
 	require.NoError(t, err)
 
 	// Check that the budget set is updated.
@@ -632,4 +653,288 @@ func TestAddWalletInputsSuccess(t *testing.T) {
 	require.Equal(t, deadline, set.DeadlineHeight())
 	// Weak check, a strong check is to open the slice and check each item.
 	require.Len(t, set.inputs, 3)
+}
+
+// TestAddWalletInputsLeasesOutputs verifies that on the happy path,
+// AddWalletInputs leases each wallet UTXO it picks via the wallet's
+// LeaseOutput method and returns the picked outpoints.
+func TestAddWalletInputsLeasesOutputs(t *testing.T) {
+	t.Parallel()
+
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+	mockInput := &input.MockInput{}
+	const budget = 10_000
+
+	defer mockInput.AssertExpectations(t)
+
+	mockInput.On("RequiredTxOut").Return(&wire.TxOut{})
+
+	deadline := int32(1000)
+	pi := &SweeperInput{
+		Input: mockInput,
+		params: Params{
+			Budget:         budget,
+			DeadlineHeight: fn.Some(deadline),
+		},
+	}
+
+	mockInput.On("OutPoint").Return(
+		wire.OutPoint{Hash: chainhash.Hash{1}},
+	)
+	mockInput.On("WitnessType").Return(
+		input.CommitmentAnchor,
+	)
+
+	walletOP := wire.OutPoint{
+		Hash:  chainhash.Hash{0xbb},
+		Index: 0,
+	}
+
+	min, max := int32(1), int32(math.MaxInt32)
+
+	walletUtxo := &lnwallet.Utxo{
+		AddressType: lnwallet.WitnessPubKey,
+		Value:       budget,
+		OutPoint:    walletOP,
+	}
+
+	wallet.On(
+		"ListUnspentWitnessFromDefaultAccount", min, max,
+	).Return([]*lnwallet.Utxo{walletUtxo}, nil).Once()
+
+	set, err := NewBudgetInputSet(
+		[]SweeperInput{*pi}, deadline,
+		fn.None[AuxSweeper](),
+	)
+	require.NoError(t, err)
+
+	usedUtxos := fn.NewSet[wire.OutPoint]()
+
+	wallet.On(
+		"LeaseOutput", mock.Anything, walletOP, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Once()
+	addedOPs, err := set.AddWalletInputs(wallet, usedUtxos)
+	require.NoError(t, err)
+
+	require.Equal(t, []wire.OutPoint{walletOP}, addedOPs)
+}
+
+func TestAddWalletInputsExcludesUsedUtxos(t *testing.T) {
+	t.Parallel()
+
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+
+	min, max := int32(1), int32(math.MaxInt32)
+
+	const budget = 10_000
+
+	mockInput := &input.MockInput{}
+	mockInput.On("RequiredTxOut").Return(&wire.TxOut{})
+	defer mockInput.AssertExpectations(t)
+
+	deadline := int32(1000)
+	pi := &SweeperInput{
+		Input: mockInput,
+		params: Params{
+			Budget:         budget,
+			DeadlineHeight: fn.Some(deadline),
+		},
+	}
+
+	mockInput.On("OutPoint").Return(
+		wire.OutPoint{Hash: chainhash.Hash{1}},
+	)
+	mockInput.On("WitnessType").Return(
+		input.CommitmentAnchor,
+	)
+
+	excludedOP := wire.OutPoint{
+		Hash:  chainhash.Hash{0xaa},
+		Index: 0,
+	}
+	availableOP := wire.OutPoint{
+		Hash:  chainhash.Hash{0xbb},
+		Index: 0,
+	}
+
+	excludedUtxo := &lnwallet.Utxo{
+		AddressType: lnwallet.WitnessPubKey,
+		Value:       budget / 2,
+		OutPoint:    excludedOP,
+	}
+	availableUtxo := &lnwallet.Utxo{
+		AddressType: lnwallet.WitnessPubKey,
+		Value:       budget,
+		OutPoint:    availableOP,
+	}
+
+	wallet.On(
+		"ListUnspentWitnessFromDefaultAccount", min, max,
+	).Return(
+		[]*lnwallet.Utxo{excludedUtxo, availableUtxo}, nil,
+	).Once()
+
+	set, err := NewBudgetInputSet(
+		[]SweeperInput{*pi}, deadline,
+		fn.None[AuxSweeper](),
+	)
+	require.NoError(t, err)
+
+	usedUtxos := fn.NewSet(excludedOP)
+
+	wallet.On(
+		"LeaseOutput", mock.Anything, availableOP, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Once()
+	addedOPs, err := set.AddWalletInputs(wallet, usedUtxos)
+	require.NoError(t, err)
+
+	require.Len(t, set.inputs, 2)
+
+	walletInput := set.inputs[1]
+	require.Equal(t, availableOP, walletInput.OutPoint())
+
+	require.Equal(t, []wire.OutPoint{availableOP}, addedOPs)
+}
+
+// TestAddWalletInputsLeaseErrorAborts verifies that if LeaseOutput
+// returns an error for a candidate wallet UTXO, AddWalletInputs
+// aborts immediately, propagates the error, and adds no outputs.
+func TestAddWalletInputsLeaseErrorAborts(t *testing.T) {
+	t.Parallel()
+
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+
+	mockInput := &input.MockInput{}
+	defer mockInput.AssertExpectations(t)
+
+	const budget = 10_000
+
+	// Use Maybe() because in the error path these methods may not
+	// be exercised (we return before NeedWalletInput is checked).
+	mockInput.On("RequiredTxOut").Return(&wire.TxOut{}).Maybe()
+	mockInput.On("OutPoint").Return(
+		wire.OutPoint{Hash: chainhash.Hash{1}},
+	).Maybe()
+	mockInput.On("WitnessType").Return(input.CommitmentAnchor).Maybe()
+
+	deadline := int32(1000)
+	pi := &SweeperInput{
+		Input: mockInput,
+		params: Params{
+			Budget:         budget,
+			DeadlineHeight: fn.Some(deadline),
+		},
+	}
+
+	walletOP := wire.OutPoint{
+		Hash:  chainhash.Hash{0xbb},
+		Index: 0,
+	}
+	walletUtxo := &lnwallet.Utxo{
+		AddressType: lnwallet.WitnessPubKey,
+		Value:       budget,
+		OutPoint:    walletOP,
+	}
+
+	min, max := int32(1), int32(math.MaxInt32)
+	wallet.On(
+		"ListUnspentWitnessFromDefaultAccount", min, max,
+	).Return([]*lnwallet.Utxo{walletUtxo}, nil).Once()
+
+	// LeaseOutput is mocked to fail with .Once(): if production
+	// code mistakenly continues to lease another UTXO this
+	// expectation would not be met or an unexpected call would
+	// panic.
+	leaseErr := errors.New("lease failed")
+	wallet.On(
+		"LeaseOutput", mock.Anything, walletOP, mock.Anything,
+	).Return(time.Time{}, leaseErr).Once()
+
+	set, err := NewBudgetInputSet(
+		[]SweeperInput{*pi}, deadline,
+		fn.None[AuxSweeper](),
+	)
+	require.NoError(t, err)
+
+	addedOPs, err := set.AddWalletInputs(
+		wallet, fn.NewSet[wire.OutPoint](),
+	)
+	require.ErrorIs(t, err, leaseErr)
+	require.Empty(t, addedOPs)
+}
+
+// TestAddWalletInputsReleasesOnAddError verifies that if LeaseOutput
+// succeeds but the subsequent addWalletInput step fails (e.g. the
+// UTXO has an unknown address type), the previously taken lease is
+// released so we don't leak a locked output.
+func TestAddWalletInputsReleasesOnAddError(t *testing.T) {
+	t.Parallel()
+
+	wallet := &MockWallet{}
+	defer wallet.AssertExpectations(t)
+
+	mockInput := &input.MockInput{}
+	defer mockInput.AssertExpectations(t)
+
+	const budget = 10_000
+
+	// Use Maybe() because the error path may not exercise these
+	// (we return before NeedWalletInput is checked).
+	mockInput.On("RequiredTxOut").Return(&wire.TxOut{}).Maybe()
+	mockInput.On("OutPoint").Return(
+		wire.OutPoint{Hash: chainhash.Hash{1}},
+	).Maybe()
+	mockInput.On("WitnessType").Return(input.CommitmentAnchor).Maybe()
+
+	deadline := int32(1000)
+	pi := &SweeperInput{
+		Input: mockInput,
+		params: Params{
+			Budget:         budget,
+			DeadlineHeight: fn.Some(deadline),
+		},
+	}
+
+	walletOP := wire.OutPoint{
+		Hash:  chainhash.Hash{0xbb},
+		Index: 0,
+	}
+
+	// UnknownAddressType causes addWalletInput to return an error
+	// after the lease has been taken, exercising the release path.
+	badUtxo := &lnwallet.Utxo{
+		AddressType: lnwallet.UnknownAddressType,
+		Value:       budget,
+		OutPoint:    walletOP,
+	}
+
+	min, max := int32(1), int32(math.MaxInt32)
+	wallet.On(
+		"ListUnspentWitnessFromDefaultAccount", min, max,
+	).Return([]*lnwallet.Utxo{badUtxo}, nil).Once()
+
+	wallet.On(
+		"LeaseOutput", mock.Anything, walletOP, mock.Anything,
+	).Return(time.Now().Add(time.Hour), nil).Once()
+
+	// The critical assertion: ReleaseOutput must be called once
+	// for the leased outpoint when addWalletInput fails.
+	wallet.On(
+		"ReleaseOutput", mock.Anything, walletOP,
+	).Return(nil).Once()
+
+	set, err := NewBudgetInputSet(
+		[]SweeperInput{*pi}, deadline,
+		fn.None[AuxSweeper](),
+	)
+	require.NoError(t, err)
+
+	addedOPs, err := set.AddWalletInputs(
+		wallet, fn.NewSet[wire.OutPoint](),
+	)
+	require.Error(t, err)
+	require.Empty(t, addedOPs)
 }

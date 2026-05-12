@@ -1,9 +1,12 @@
 package sweep
 
 import (
+	"time"
+
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
@@ -30,6 +33,19 @@ type Wallet interface {
 	// ability to execute a function closure under an exclusive coin
 	// selection lock.
 	WithCoinSelectLock(f func() error) error
+
+	// LeaseOutput locks an output to the given ID, preventing it from
+	// being available for coin selection. The absolute time of the lock's
+	// expiry is returned. The expiration of the lock is relative to the
+	// backend's best block time, not the system clock. An error is
+	// returned if the output is already locked to a different ID.
+	LeaseOutput(id wtxmgr.LockID, op wire.OutPoint,
+		duration time.Duration) (time.Time, error)
+
+	// ReleaseOutput unlocks an output, allowing it to be available
+	// for coin selection if it remains unspent. The ID should match
+	// the one used to originally lock the output.
+	ReleaseOutput(id wtxmgr.LockID, op wire.OutPoint) error
 
 	// RemoveDescendants removes any wallet transactions that spends
 	// outputs created by the specified transaction.
